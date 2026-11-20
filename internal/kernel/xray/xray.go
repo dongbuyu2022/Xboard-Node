@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,8 +32,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -90,7 +90,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
 		ForceCloseConnection: false,
-		ForceCloseUser:       false,
+		ForceCloseUser:       true,
 	}
 }
 
@@ -164,6 +164,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
+	x.syncAdmissions()
 
 	nlog.Core().Info("xray started",
 		"users", len(users),
@@ -250,8 +251,21 @@ func (x *Xray) CloseConnection(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	x.mu.Lock()
+	var email string
+	for _, u := range x.users {
+		if u.UUID == uuid {
+			email = userEmail(u.ID)
+			break
+		}
+	}
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if email == "" || ld == nil {
+		return nil
+	}
+	ld.CloseEmail(email)
 	return nil
 }
 
@@ -314,7 +328,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -346,6 +360,9 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
 			continue
 		}
+		if ld := x.currentLimitDispatcher(); ld != nil {
+			ld.Allow(mu)
+		}
 		added++
 	}
 
@@ -361,7 +378,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 }
 
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
-// Truly hitless for supported protocols — remaining connections unaffected.
+// Removed users' existing flows are closed. Remaining users stay connected.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
@@ -386,18 +403,19 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		return 0, nil
 	}
 
-	if len(kept) == 0 {
-		x.mu.Unlock()
-		x.Stop()
-		return removed, nil
-	}
+	// Keep the listener up even when the last user is removed. Quota restore
+	// is an AddUsers on the same instance; stopping here would drop that add
+	// until a full process restart.
 
 	um, err := x.getUserManager()
 	if err != nil {
-		nc, t := x.nodeConfig, x.tls
+		nc, tlsCert := x.nodeConfig, x.tls
 		x.mu.Unlock()
+		if nc == nil {
+			return 0, err
+		}
 		nlog.Core().Debug("xray: RemoveUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, kept, t); err != nil {
+		if err := x.Start(nc, kept, tlsCert); err != nil {
 			return 0, err
 		}
 		return removed, nil
@@ -406,13 +424,19 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	ctx := context.Background()
 	actualRemoved := 0
-	for _, u := range users {
-		email := userEmail(u.ID)
+	removedEmails := emailsForUsers(users, removeSet)
+	for _, email := range removedEmails {
 		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
+			nlog.Core().Debug("xray: RemoveUser skipped", "email", email, "error", err)
 			continue
 		}
 		actualRemoved++
+	}
+	// Revoke even when RemoveUser reports the account is already gone.
+	// A flow authenticated against the old MemoryUser must still be closed,
+	// including one that registers only after this call returns.
+	if ld := x.currentLimitDispatcher(); ld != nil {
+		ld.RevokeEmails(removedEmails)
 	}
 
 	x.mu.Lock()
@@ -464,13 +488,20 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	x.mu.Unlock()
 
 	ctx := context.Background()
+	ld := x.currentLimitDispatcher()
 
-	// Remove first, then add (order matters for UUID changes on same ID)
+	// Remove first, then add (order matters for UUID changes on same ID).
+	// Only the removed emails are disconnected; everyone else stays up.
+	removedEmails := make([]string, 0, len(toRemove))
 	for _, u := range toRemove {
 		email := userEmail(u.ID)
+		removedEmails = append(removedEmails, email)
 		if err := um.RemoveUser(ctx, email); err != nil {
 			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
 		}
+	}
+	if ld != nil {
+		ld.RevokeEmails(removedEmails)
 	}
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
@@ -480,6 +511,10 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		}
 		if err := um.AddUser(ctx, mu); err != nil {
 			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+			continue
+		}
+		if ld != nil {
+			ld.Allow(mu)
 		}
 	}
 
@@ -774,6 +809,44 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 		bps := int64(u.SpeedLimit) * 1_000_000 / 8
 		bm.SetUserLimit(email, bps)
 	}
+}
+
+func (x *Xray) currentLimitDispatcher() *LimitDispatcher {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	return ld
+}
+
+// syncAdmissions binds the MemoryUser pointers xray created at startup.
+// Later Add/Remove calls bind the pointers they pass to UserManager.
+func (x *Xray) syncAdmissions() {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	users := append([]model.UserSpec(nil), x.users...)
+	um, err := x.getUserManager()
+	x.mu.Unlock()
+	if ld == nil || err != nil {
+		return
+	}
+	ctx := context.Background()
+	live := make([]*protocol.MemoryUser, 0, len(users))
+	for _, u := range users {
+		if mu := um.GetUser(ctx, userEmail(u.ID)); mu != nil {
+			live = append(live, mu)
+		}
+	}
+	ld.SetLiveUsers(live)
+}
+
+func emailsForUsers(users []model.UserSpec, ids map[int]struct{}) []string {
+	out := make([]string, 0, len(ids))
+	for _, u := range users {
+		if _, ok := ids[u.ID]; ok {
+			out = append(out, userEmail(u.ID))
+		}
+	}
+	return out
 }
 
 // updateDispatcherLimits configures the LimitDispatcher with per-user

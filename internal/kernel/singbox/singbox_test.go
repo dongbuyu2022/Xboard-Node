@@ -5,11 +5,14 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/auth"
 	singM "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/time/rate"
 )
@@ -36,9 +39,8 @@ func TestSingBoxCapabilities(t *testing.T) {
 	}
 }
 
-
-
 type testConn struct {
+	mu     sync.Mutex
 	closed bool
 	reads  [][]byte
 	writes [][]byte
@@ -60,11 +62,22 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error { c.closed = true; return nil }
-func (c *testConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) SetDeadline(time.Time) error { return nil }
-func (c *testConn) SetReadDeadline(time.Time) error { return nil }
+func (c *testConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *testConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
 
 func testInboundContext(uuid, ip string) adapter.InboundContext {
@@ -137,7 +150,7 @@ func TestConnTrackerRoutedConnectionRejectsWhenDeviceLimitExceeded(t *testing.T)
 	if wrapped2 != second {
 		t.Fatal("expected rejected connection to be returned unwrapped")
 	}
-	if !second.closed {
+	if !second.isClosed() {
 		t.Fatal("expected rejected connection to be closed")
 	}
 }
@@ -175,7 +188,7 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 	if !tracker.CloseByID(tracked.connID) {
 		t.Fatal("CloseByID() = false, want true")
 	}
-	if !base.closed {
+	if !base.isClosed() {
 		t.Fatal("expected underlying connection to be closed")
 	}
 }
@@ -211,5 +224,139 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 	cancelWrite()
 	if n, err := writeTracked.Write([]byte("a")); !errors.Is(err, context.Canceled) || n != 0 {
 		t.Fatalf("second Write() = (%d, %v), want (0, context canceled)", n, err)
+	}
+}
+
+func commitUsers(t *testing.T, tracker *ConnTracker, users []model.UserSpec) []func() {
+	t.Helper()
+	_, next, gen := tracker.PlanSlots(users)
+	return tracker.CommitSlots(next, gen)
+}
+
+func TestConnTrackerSlotRevokeClosesOnlyThatUser(t *testing.T) {
+	tracker := NewConnTracker(0)
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}}
+	commitUsers(t, tracker, users)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+
+	ctx1 := auth.ContextWithUser(context.Background(), 0)
+	ctx2 := auth.ContextWithUser(context.Background(), 1)
+	c1 := &testConn{}
+	c2 := &testConn{}
+	if got := tracker.RoutedConnection(ctx1, c1, testInboundContext("uuid-1", "1.1.1.1"), nil, nil); got == c1 {
+		t.Fatal("user 1 should be tracked")
+	}
+	if got := tracker.RoutedConnection(ctx2, c2, testInboundContext("uuid-2", "2.2.2.2"), nil, nil); got == c2 {
+		t.Fatal("user 2 should be tracked")
+	}
+
+	closers := commitUsers(t, tracker, []model.UserSpec{{ID: 2, UUID: "uuid-2"}})
+	for _, closeFn := range closers {
+		closeFn()
+	}
+	if !c1.isClosed() {
+		t.Fatal("removed user's TCP flow should be closed")
+	}
+	if c2.isClosed() {
+		t.Fatal("other user's flow must stay open")
+	}
+
+	late := &testConn{}
+	if got := tracker.RoutedConnection(ctx1, late, testInboundContext("uuid-1", "1.1.1.9"), nil, nil); got != late || !late.isClosed() {
+		t.Fatal("auth index from the removed generation must be closed on registration")
+	}
+
+	closers = commitUsers(t, tracker, []model.UserSpec{{ID: 2, UUID: "uuid-2"}})
+	for _, closeFn := range closers {
+		closeFn()
+	}
+	if c2.isClosed() {
+		t.Fatal("repeated removal must not close the remaining user")
+	}
+
+	commitUsers(t, tracker, users)
+	ctxNew := auth.ContextWithUser(context.Background(), 2)
+	fresh := &testConn{}
+	if got := tracker.RoutedConnection(ctxNew, fresh, testInboundContext("uuid-1", "1.1.1.3"), nil, nil); got == fresh || fresh.isClosed() {
+		t.Fatal("re-added user must accept a new slot")
+	}
+	stale := &testConn{}
+	if got := tracker.RoutedConnection(ctx1, stale, testInboundContext("uuid-1", "1.1.1.4"), nil, nil); got != stale || !stale.isClosed() {
+		t.Fatal("old slot must stay dead after the user is added again")
+	}
+	if _, _, n := tracker.GetUserTraffic(); n != 2 {
+		t.Fatalf("connCount = %d, want 2 (user 2 + re-added user)", n)
+	}
+}
+
+func TestConnTrackerCloseByUUIDReleasesRefs(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+	a := &testConn{}
+	b := &testConn{}
+	tracker.RoutedConnection(context.Background(), a, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	wrappedB := tracker.RoutedConnection(context.Background(), b, testInboundContext("uuid-2", "2.2.2.2"), nil, nil)
+	if n := tracker.CloseByUUID("uuid-1"); n != 1 {
+		t.Fatalf("CloseByUUID() = %d, want 1", n)
+	}
+	if !a.isClosed() || b.isClosed() {
+		t.Fatalf("close flags a=%v b=%v", a.isClosed(), b.isClosed())
+	}
+	if n := tracker.CloseByUUID("uuid-1"); n != 0 {
+		t.Fatalf("repeated CloseByUUID() = %d, want 0", n)
+	}
+	if tracker.trackedRefs() != 1 {
+		t.Fatalf("tracked refs = %d, want 1", tracker.trackedRefs())
+	}
+	if err := wrappedB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if tracker.trackedRefs() != 0 {
+		t.Fatalf("tracked refs after natural close = %d, want 0", tracker.trackedRefs())
+	}
+	if _, _, n := tracker.GetUserTraffic(); n != 0 {
+		t.Fatalf("connCount = %d, want 0", n)
+	}
+}
+
+func TestConnTrackerReserveRacesSlotRevoke(t *testing.T) {
+	tracker := NewConnTracker(0)
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	commitUsers(t, tracker, users)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+	ctx := auth.ContextWithUser(context.Background(), 0)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			c := &testConn{}
+			got := tracker.RoutedConnection(ctx, c, testInboundContext("uuid-1", "10.1.1.1"), nil, nil)
+			if got != c {
+				_ = got.Close()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			closers := commitUsers(t, tracker, nil)
+			for _, closeFn := range closers {
+				closeFn()
+			}
+			commitUsers(t, tracker, users)
+		}
+	}()
+	wg.Wait()
+	closers := commitUsers(t, tracker, nil)
+	for _, closeFn := range closers {
+		closeFn()
+	}
+	if _, _, n := tracker.GetUserTraffic(); n != 0 {
+		t.Fatalf("connCount = %d, want 0", n)
+	}
+	if tracker.trackedRefs() != 0 {
+		t.Fatalf("tracked refs = %d, want 0", tracker.trackedRefs())
 	}
 }

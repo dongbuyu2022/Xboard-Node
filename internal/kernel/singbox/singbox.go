@@ -32,7 +32,8 @@ const drainTimeout = 5 * time.Second
 //
 // User operations (AddUsers/RemoveUsers/UpdateUsers) use sing-box's native
 // UpdatableInbound interface, which hot-swaps user credentials without
-// restarting listeners — zero connection disruption.
+// restarting listeners. Remaining users keep their connections. Removed
+// users have their existing TCP and UDP flows closed.
 type SingBox struct {
 	cfg config.KernelConfig
 
@@ -93,7 +94,9 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
+	tracker := NewConnTracker(0)
+	ordered, nextSlots, nextGen := tracker.PlanSlots(users)
+	cfgMap := buildConfig(s.cfg, nodeConfig, ordered, tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -139,8 +142,10 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.nodeConfig = nodeConfig
 	s.tls = tls
 
-	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(0)
+	// Fresh tracker on full restart. Slots are committed only after the
+	// instance is listening, so a failed start does not publish them.
+	tracker.CommitSlots(nextSlots, nextGen)
+	s.connTracker = tracker
 	s.connTracker.SetUserMap(buildUserMap(users))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
@@ -450,15 +455,17 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	}
 
 	merged := append(append([]model.UserSpec{}, s.users...), toAdd...)
-	if err := s.reloadInboundsLocked(merged); err != nil {
+	closers, err := s.reloadInboundsLocked(merged)
+	if err != nil {
 		return 0, err
 	}
 	s.users = merged
+	runClosers(closers)
 	return len(toAdd), nil
 }
 
-// RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
-// for remaining users.
+// RemoveUsers hot-swaps users out of running inbounds. Connections that
+// belong to removed users are closed. Everyone else stays connected.
 func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -484,10 +491,12 @@ func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 		return 0, nil
 	}
 
-	if err := s.reloadInboundsLocked(kept); err != nil {
+	closers, err := s.reloadInboundsLocked(kept)
+	if err != nil {
 		return 0, err
 	}
 	s.users = kept
+	runClosers(closers)
 	return removed, nil
 }
 
@@ -512,35 +521,46 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 		return 0, 0, nil
 	}
 
-	if err = s.reloadInboundsLocked(users); err != nil {
+	var closers []func()
+	closers, err = s.reloadInboundsLocked(users)
+	if err != nil {
 		return 0, 0, err
 	}
 	s.users = users
+	runClosers(closers)
 	return
 }
 
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
-// Must be called with s.mu held.
-func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
-	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls)
+// Must be called with s.mu held. Closers are returned so the caller can
+// close revoked flows after the authenticator has been updated. Slot state
+// is committed only after that update succeeds.
+func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) ([]func(), error) {
+	ordered := users
+	var nextSlots []admissionSlot
+	var nextGen uint64
+	if s.connTracker != nil {
+		ordered, nextSlots, nextGen = s.connTracker.PlanSlots(users)
+	}
+	cfgMap := buildConfig(s.cfg, s.nodeConfig, ordered, s.tls)
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		return nil, fmt.Errorf("marshal config: %w", err)
 	}
 
 	opts, err := singJSON.UnmarshalExtendedContext[option.Options](s.ctx, data)
 	if err != nil {
-		return fmt.Errorf("parse options: %w", err)
+		return nil, fmt.Errorf("parse options: %w", err)
 	}
 
 	im := service.FromContext[adapter.InboundManager](s.ctx)
 	if im == nil {
-		return fmt.Errorf("inbound manager not available")
+		return nil, fmt.Errorf("inbound manager not available")
 	}
 
 	router := service.FromContext[adapter.Router](s.ctx)
 	if router == nil {
-		return fmt.Errorf("router not available")
+		return nil, fmt.Errorf("router not available")
 	}
 
 	nopFactory := singLog.NewNOPFactory()
@@ -601,16 +621,26 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		_ = im.Remove(tag)
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
 		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
-			return fmt.Errorf("recreate inbound %s: %w", tag, err)
+			return nil, fmt.Errorf("recreate inbound %s: %w", tag, err)
 		}
 	}
 
+	var closers []func()
 	if s.connTracker != nil {
+		closers = s.connTracker.CommitSlots(nextSlots, nextGen)
 		s.connTracker.SetUserMap(buildUserMap(users))
 	}
 
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
-	return nil
+	return closers, nil
+}
+
+func runClosers(closers []func()) {
+	for _, closeFn := range closers {
+		if closeFn != nil {
+			closeFn()
+		}
+	}
 }
 
 // ─── Observability ──────────────────────────────────────────────────────────
