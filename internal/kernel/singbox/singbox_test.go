@@ -319,40 +319,58 @@ func TestConnTrackerCloseByUUIDReleasesRefs(t *testing.T) {
 	}
 }
 
-func TestPlanSlotsDoesNotGrowAcrossRestoreAfterGrace(t *testing.T) {
-	prev := tombstoneReuseAfter
-	tombstoneReuseAfter = 0
-	t.Cleanup(func() { tombstoneReuseAfter = prev })
+func TestOldSlotStaysDeadAfterClockPassesFormerReuseWindow(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := start
+	prev := admissionNow
+	admissionNow = func() time.Time { return clock }
+	t.Cleanup(func() { admissionNow = prev })
 
 	tracker := NewConnTracker(0)
-	user := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
-	commitUsers(t, tracker, user)
-	for i := 0; i < 20; i++ {
-		commitUsers(t, tracker, nil)
-		commitUsers(t, tracker, user)
+	commitUsers(t, tracker, []model.UserSpec{{ID: 1, UUID: "uuid-1"}})
+	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+	oldCtx := auth.ContextWithUser(context.Background(), 0)
+	old := &testConn{}
+	if got := tracker.RoutedConnection(oldCtx, old, testInboundContext("uuid-1", "1.1.1.1"), nil, nil); got == old {
+		t.Fatal("original generation should be tracked")
 	}
+
+	for _, closeFn := range commitUsers(t, tracker, nil) {
+		closeFn()
+	}
+	if !old.isClosed() {
+		t.Fatal("removed user's flow should close")
+	}
+	clock = clock.Add(31 * time.Second)
+	commitUsers(t, tracker, []model.UserSpec{{ID: 1, UUID: "uuid-1"}})
+
 	tracker.usersMu.RLock()
-	n := len(tracker.slots)
-	alive := 0
-	for _, slot := range tracker.slots {
-		if slot.alive {
-			alive++
+	if len(tracker.slots) < 2 || tracker.slots[0].alive || tracker.slots[0].gen == tracker.slots[1].gen {
+		t.Fatalf("index 0 was recycled or generations collided: %+v", tracker.slots)
+	}
+	newIdx := -1
+	for i, slot := range tracker.slots {
+		if slot.alive && slot.uuid == "uuid-1" {
+			newIdx = i
 		}
 	}
 	tracker.usersMu.RUnlock()
-	if alive != 1 {
-		t.Fatalf("alive slots = %d, want 1", alive)
+	if newIdx != 1 {
+		t.Fatalf("restored user index = %d, want a new slot", newIdx)
 	}
-	if n > 2 {
-		t.Fatalf("slots after 20 restores = %d, want reuse instead of unbounded growth", n)
+
+	late := &testConn{}
+	if got := tracker.RoutedConnection(oldCtx, late, testInboundContext("uuid-1", "1.1.1.2"), nil, nil); got != late || !late.isClosed() {
+		t.Fatal("auth context older than 30s was accepted as the reused user")
+	}
+	fresh := &testConn{}
+	freshCtx := auth.ContextWithUser(context.Background(), newIdx)
+	if got := tracker.RoutedConnection(freshCtx, fresh, testInboundContext("uuid-1", "1.1.1.3"), nil, nil); got == fresh || fresh.isClosed() {
+		t.Fatal("new slot should accept the restored user")
 	}
 }
 
 func TestPlanSlotsKeepsFreshTombstone(t *testing.T) {
-	prev := tombstoneReuseAfter
-	tombstoneReuseAfter = time.Hour
-	t.Cleanup(func() { tombstoneReuseAfter = prev })
-
 	tracker := NewConnTracker(0)
 	commitUsers(t, tracker, []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}})
 	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})

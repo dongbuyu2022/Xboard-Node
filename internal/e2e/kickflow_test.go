@@ -25,8 +25,8 @@ import (
 // (cedar2025/Xray-core and cedar2025/sing-box replaces, not an upstream
 // Xray stand-in). The panel is synthetic and holds no production credentials.
 //
-// Not covered here: VLESS mux, XUDP, and TLS/REALITY. Those paths share the
-// same admission hook but are not exercised with live sockets.
+// Mux/XUDP, Hy2, REALITY/Vision, gRPC and XHTTP are covered by the other
+// tests in this package. Plain TCP/UDP here is the same admission hook.
 
 const (
 	user1 = "11111111-1111-4111-8111-111111111111"

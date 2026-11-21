@@ -14,15 +14,15 @@ import (
 
 var nextGenFallback atomic.Uint64
 
-// tombstoneReuseAfter is how long a removed sing-box user index stays dead.
-// The index is captured in the auth context before RoutedConnection runs, so
-// it must not be handed to a new admission while that handshake can still
-// arrive. After the window, the hole can be reused and trailing holes dropped,
-// otherwise every quota restore would append a user forever.
-var tombstoneReuseAfter = 30 * time.Second
+// admissionNow is the clock used only to stamp when a slot died.
+// Slot identity does not depend on it: an index is never reused, because
+// sing-box stores that index in the auth context with no deadline before
+// RoutedConnection. Recycling the index after any delay, including past 30s,
+// would let a stalled handshake register as the new user.
+var admissionNow = time.Now
 
-// admissionSlot is one sing-box user index. The index is the value sing-box
-// stores in the connection context at authentication time.
+// admissionSlot is one sing-box user index captured at authentication.
+// gen is unique for the life of the process. A dead index stays dead.
 type admissionSlot struct {
 	id     int
 	uuid   string
@@ -142,69 +142,29 @@ func planSlots(current []admissionSlot, users []model.UserSpec, nextGen uint64) 
 			continue
 		}
 		slot.alive = false
-		slot.deadAt = time.Now()
+		slot.deadAt = admissionNow()
 		slot.uuid = newTombUUID()
 		slot.spec = model.UserSpec{ID: -1, UUID: slot.uuid}
 	}
-	next = trimExpiredTombstones(next)
 	for _, u := range users {
 		if _, pending := live[u.ID]; !pending {
 			continue
 		}
 		delete(live, u.ID)
 		nextGen++
-		slot := admissionSlot{
+		next = append(next, admissionSlot{
 			id:    u.ID,
 			uuid:  u.UUID,
 			gen:   nextGen,
 			alive: true,
 			spec:  u,
-		}
-		if hole := reusableTombstone(next); hole >= 0 {
-			next[hole] = slot
-			continue
-		}
-		next = append(next, slot)
+		})
 	}
 	ordered := make([]model.UserSpec, len(next))
 	for i, slot := range next {
 		ordered[i] = slot.spec
 	}
 	return ordered, next, nextGen
-}
-
-func trimExpiredTombstones(slots []admissionSlot) []admissionSlot {
-	for len(slots) > 0 {
-		last := slots[len(slots)-1]
-		if last.alive || !tombstoneExpired(last) {
-			break
-		}
-		slots = slots[:len(slots)-1]
-	}
-	return slots
-}
-
-func reusableTombstone(slots []admissionSlot) int {
-	best := -1
-	var oldest time.Time
-	for i := range slots {
-		slot := slots[i]
-		if slot.alive || !tombstoneExpired(slot) {
-			continue
-		}
-		if best < 0 || slot.deadAt.Before(oldest) {
-			best = i
-			oldest = slot.deadAt
-		}
-	}
-	return best
-}
-
-func tombstoneExpired(slot admissionSlot) bool {
-	if slot.deadAt.IsZero() {
-		return false
-	}
-	return time.Since(slot.deadAt) >= tombstoneReuseAfter
 }
 
 func newTombUUID() string {
