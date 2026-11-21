@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"errors"
+	"net"
 	"reflect"
 	"sort"
 	"sync"
@@ -12,7 +13,8 @@ import (
 	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/net"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
@@ -52,6 +54,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		inner:      orig,
 		innerDisp:  inner,
 		limitedIPs: make(map[string]map[string]int),
+		byEmail:    make(map[string]map[*trackedLink]struct{}),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -81,6 +84,35 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// connMu guards the admission generation and the closable-link index.
+	// It is never held while a connection or link writer is closed.
+	connMu  sync.Mutex
+	live    map[string]*admission // email → generation authenticated against the current MemoryUser
+	byEmail map[string]map[*trackedLink]struct{}
+	genSeq  uint64
+}
+
+// admission is one user generation. The MemoryUser pointer is the token
+// captured by xray at authentication time (validator.Get returns that pointer).
+// Removing the user drops it; adding the user back installs a new pointer.
+// A flow that authenticated against an older pointer is closed even if it
+// reaches trackLink only after the user has been added again.
+type admission struct {
+	user *protocol.MemoryUser
+	gen  uint64
+}
+
+// trackedLink is one dispatched flow. Reader is intentionally not wrapped:
+// mux and XUDP type-assert the concrete pipe reader. Closing the inbound
+// net.Conn (and interrupting the wrapped writer) stops TCP and the UDP
+// sessions carried on that VLESS/VMess connection.
+type trackedLink struct {
+	email  string
+	user   *protocol.MemoryUser
+	gen    uint64
+	conn   net.Conn
+	writer *closeTrackingWriter
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
@@ -102,7 +134,7 @@ func (ic *ipCounter) aliveIPs() map[string]bool {
 
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
 
-func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
+func (d *LimitDispatcher) Dispatch(ctx context.Context, dest xnet.Destination) (*transport.Link, error) {
 	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return nil, err
@@ -116,20 +148,20 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		return nil, err
 	}
 
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if email != "" && !d.trackLink(ctx, link, email, sourceIP, isTCP) {
+		return nil, errors.New("user revoked")
 	}
 	return link, nil
 }
 
-func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
+func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest xnet.Destination, link *transport.Link) error {
 	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return err
 	}
 
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if email != "" && !d.trackLink(ctx, link, email, sourceIP, isTCP) {
+		return errors.New("user revoked")
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
@@ -137,14 +169,14 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 // identifyAndCheck extracts user identity from the session context, enforces
 // device limits, and returns the user's email, source IP, and TCP flag.
 // Returns a non-nil error only when the connection should be rejected.
-func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email, sourceIP string, isTCP bool, err error) {
+func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest xnet.Destination) (email, sourceIP string, isTCP bool, err error) {
 	si := session.InboundFromContext(ctx)
 	if si == nil || si.User == nil || len(si.User.Email) == 0 {
 		return "", "", false, nil
 	}
 	email = si.User.Email
 	sourceIP = si.Source.Address.IP().String()
-	isTCP = dest.Network == net.Network_TCP
+	isTCP = dest.Network == xnet.Network_TCP
 
 	if d.checkDeviceLimit(email, sourceIP, isTCP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
@@ -156,19 +188,257 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 // trackLink records connection lifecycle without mutating xray-core owned
 // transport primitives. This keeps mux/XUDP compatible while still allowing
 // the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
+func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool) bool {
 	d.connCount.Add(1)
 
+	tl := &trackedLink{email: email}
+	if si := session.InboundFromContext(ctx); si != nil {
+		tl.user = si.User
+		tl.conn = si.Conn
+	}
 	onClose := func() {
+		d.unlink(tl)
 		if isTCP {
 			d.delConn(email, sourceIP)
 		}
 		d.connCount.Add(-1)
 	}
+	cw := &closeTrackingWriter{Writer: link.Writer, onClose: onClose}
+	tl.writer = cw
+	link.Writer = cw
 
-	link.Writer = &closeTrackingWriter{
-		Writer:  link.Writer,
-		onClose: onClose,
+	if !d.admit(tl) {
+		// Interrupt releases device-limit and connCount exactly once.
+		// Close the accepted socket outside connMu so a late-registered
+		// flow cannot outlive revocation, including remove-then-add.
+		cw.Interrupt()
+		if tl.conn != nil {
+			_ = tl.conn.Close()
+		}
+		return false
+	}
+	return true
+}
+
+// admit records tl under the current user generation, or rejects it when the
+// flow authenticated against a user object that is no longer live.
+// A nil live map means admissions have not been installed yet (startup or
+// unit tests); the link is still tracked so a later SetLiveUsers can drop it.
+func (d *LimitDispatcher) admit(tl *trackedLink) bool {
+	d.connMu.Lock()
+	defer d.connMu.Unlock()
+	if d.live == nil {
+		d.trackLocked(tl)
+		return true
+	}
+	adm := d.live[tl.email]
+	if adm == nil || tl.user == nil || adm.user != tl.user {
+		return false
+	}
+	tl.gen = adm.gen
+	d.trackLocked(tl)
+	return true
+}
+
+func (d *LimitDispatcher) trackLocked(tl *trackedLink) {
+	if d.byEmail == nil {
+		d.byEmail = make(map[string]map[*trackedLink]struct{})
+	}
+	set := d.byEmail[tl.email]
+	if set == nil {
+		set = make(map[*trackedLink]struct{})
+		d.byEmail[tl.email] = set
+	}
+	set[tl] = struct{}{}
+}
+
+func (d *LimitDispatcher) unlink(tl *trackedLink) {
+	if tl == nil {
+		return
+	}
+	d.connMu.Lock()
+	if set := d.byEmail[tl.email]; set != nil {
+		delete(set, tl)
+		if len(set) == 0 {
+			delete(d.byEmail, tl.email)
+		}
+	}
+	d.connMu.Unlock()
+}
+
+func (tl *trackedLink) kick() {
+	if tl == nil {
+		return
+	}
+	if tl.writer != nil {
+		tl.writer.Interrupt()
+	}
+	if tl.conn != nil {
+		_ = tl.conn.Close()
+	}
+}
+
+// SetLiveUsers installs the MemoryUser pointers currently stored in the
+// xray user manager. Pointers that are unchanged keep their generation and
+// their open flows. A replaced or removed user closes every older flow.
+func (d *LimitDispatcher) SetLiveUsers(users []*protocol.MemoryUser) {
+	if d == nil {
+		return
+	}
+	var closers []func()
+	d.connMu.Lock()
+	next := make(map[string]*admission, len(users))
+	for _, user := range users {
+		if user == nil || user.Email == "" {
+			continue
+		}
+		if old := d.live[user.Email]; old != nil && old.user == user {
+			next[user.Email] = old
+			continue
+		}
+		d.genSeq++
+		next[user.Email] = &admission{user: user, gen: d.genSeq}
+		closers = append(closers, d.takeClosersLocked(user.Email, user, nil)...)
+	}
+	if d.live != nil {
+		for email := range d.live {
+			if _, ok := next[email]; ok {
+				continue
+			}
+			closers = append(closers, d.takeClosersLocked(email, nil, nil)...)
+		}
+	}
+	d.live = next
+	d.connMu.Unlock()
+	runClosers(closers)
+}
+
+// Allow publishes one authenticated user generation. Re-allowing the same
+// MemoryUser pointer does not disturb its flows. A new pointer (remove then
+// add) closes flows that still carry the previous pointer.
+func (d *LimitDispatcher) Allow(user *protocol.MemoryUser) {
+	if d == nil || user == nil || user.Email == "" {
+		return
+	}
+	var closers []func()
+	d.connMu.Lock()
+	if d.live == nil {
+		d.live = make(map[string]*admission)
+	}
+	if old := d.live[user.Email]; old != nil && old.user == user {
+		d.connMu.Unlock()
+		return
+	}
+	d.genSeq++
+	d.live[user.Email] = &admission{user: user, gen: d.genSeq}
+	closers = d.takeClosersLocked(user.Email, user, nil)
+	d.connMu.Unlock()
+	runClosers(closers)
+}
+
+// RevokeEmails drops whatever generation is currently live for each email and
+// closes its flows. Prefer RevokePointer when the caller still has the
+// MemoryUser it removed: a concurrent add may already have installed a newer
+// pointer, and this call must not delete that generation.
+func (d *LimitDispatcher) RevokeEmails(emails []string) {
+	if d == nil || len(emails) == 0 {
+		return
+	}
+	var closers []func()
+	d.connMu.Lock()
+	if d.live == nil {
+		d.live = make(map[string]*admission)
+	}
+	for _, email := range emails {
+		closers = append(closers, d.revokeLocked(email, nil)...)
+	}
+	d.connMu.Unlock()
+	runClosers(closers)
+}
+
+// RevokePointer retires one authenticated user object. Flows and the live
+// admission are removed only when they still point at that object. A newer
+// Allow of the same email is left in place, including flows it already accepted.
+func (d *LimitDispatcher) RevokePointer(user *protocol.MemoryUser) {
+	if d == nil || user == nil || user.Email == "" {
+		return
+	}
+	d.connMu.Lock()
+	if d.live == nil {
+		d.live = make(map[string]*admission)
+	}
+	closers := d.revokeLocked(user.Email, user)
+	d.connMu.Unlock()
+	runClosers(closers)
+}
+
+// revokeLocked closes flows for email. only, when non-nil, limits the revoke
+// to that MemoryUser so a generation installed by a later add survives.
+func (d *LimitDispatcher) revokeLocked(email string, only *protocol.MemoryUser) []func() {
+	if email == "" {
+		return nil
+	}
+	if only != nil {
+		if adm := d.live[email]; adm != nil && adm.user == only {
+			delete(d.live, email)
+		}
+		return d.takeClosersLocked(email, nil, only)
+	}
+	current := d.live[email]
+	delete(d.live, email)
+	if current == nil {
+		return d.takeClosersLocked(email, nil, nil)
+	}
+	// Email-wide revoke still must not take flows that already belong to a
+	// pointer other than the one we just unpublished. Re-read: we deleted
+	// current, so every tracked flow of this email was authenticated as
+	// current or as an older object. Close all of them.
+	return d.takeClosersLocked(email, nil, nil)
+}
+
+// CloseEmail closes currently tracked flows without removing the user.
+// Newly authenticated flows of the same generation stay allowed.
+func (d *LimitDispatcher) CloseEmail(email string) int {
+	if d == nil || email == "" {
+		return 0
+	}
+	d.connMu.Lock()
+	closers := d.takeClosersLocked(email, nil, nil)
+	d.connMu.Unlock()
+	runClosers(closers)
+	return len(closers)
+}
+
+// takeClosersLocked detaches flows for email. keepUser, when non-nil, leaves
+// flows authenticated as that exact user object in place. onlyUser, when
+// non-nil, detaches only flows authenticated as that object.
+func (d *LimitDispatcher) takeClosersLocked(email string, keepUser, onlyUser *protocol.MemoryUser) []func() {
+	set := d.byEmail[email]
+	if len(set) == 0 {
+		return nil
+	}
+	var closers []func()
+	for tl := range set {
+		if keepUser != nil && tl.user == keepUser {
+			continue
+		}
+		if onlyUser != nil && tl.user != onlyUser {
+			continue
+		}
+		delete(set, tl)
+		closers = append(closers, tl.kick)
+	}
+	if len(set) == 0 {
+		delete(d.byEmail, email)
+	}
+	return closers
+}
+
+func runClosers(closers []func()) {
+	for _, closeFn := range closers {
+		if closeFn != nil {
+			closeFn()
+		}
 	}
 }
 

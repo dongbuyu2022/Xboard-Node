@@ -1,11 +1,16 @@
 package xray
 
 import (
+	"context"
+	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -185,7 +190,6 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 	}
 }
 
-
 func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	ld := newTestDispatcher()
 	email := userEmail(1)
@@ -195,7 +199,7 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
 	link := &transport.Link{Reader: origReader, Writer: origWriter}
 
-	ld.trackLink(link, email, "1.1.1.1", true)
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
 
 	if link.Reader != origReader {
 		t.Fatal("trackLink must not replace link.Reader")
@@ -214,7 +218,7 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 
 	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
-	ld.trackLink(link, email, "1.1.1.1", true)
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
 
 	if got := ld.connCount.Load(); got != 1 {
 		t.Fatalf("expected connCount=1 after tracking, got %d", got)
@@ -231,5 +235,241 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
 		t.Fatal("device slot should be released after writer close")
+	}
+}
+
+type kickWriter struct {
+	kicked atomic.Bool
+}
+
+func (w *kickWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	buf.ReleaseMulti(mb)
+	return nil
+}
+
+func (w *kickWriter) Interrupt() { w.kicked.Store(true) }
+
+func (w *kickWriter) Close() error {
+	w.kicked.Store(true)
+	return nil
+}
+
+type closeOnlyConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeOnlyConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func userContext(user *protocol.MemoryUser, conn net.Conn) context.Context {
+	return session.ContextWithInbound(context.Background(), &session.Inbound{User: user, Conn: conn})
+}
+
+func TestLimitDispatcher_RevokeClosesTrackedAndLateRegistration(t *testing.T) {
+	ld := newTestDispatcher()
+	oldUser := &protocol.MemoryUser{Email: userEmail(1)}
+	other := &protocol.MemoryUser{Email: userEmail(2)}
+	ld.Allow(oldUser)
+	ld.Allow(other)
+
+	targetConn := &closeOnlyConn{}
+	targetWriter := &kickWriter{}
+	target := &transport.Link{Reader: nopReader{}, Writer: targetWriter}
+	if !ld.trackLink(userContext(oldUser, targetConn), target, oldUser.Email, "1.1.1.1", true) {
+		t.Fatal("target flow should be admitted")
+	}
+	otherConn := &closeOnlyConn{}
+	otherWriter := &kickWriter{}
+	otherLink := &transport.Link{Reader: nopReader{}, Writer: otherWriter}
+	if !ld.trackLink(userContext(other, otherConn), otherLink, other.Email, "8.8.8.8", true) {
+		t.Fatal("other user should be admitted")
+	}
+
+	ld.RevokeEmails([]string{oldUser.Email})
+	if !targetWriter.kicked.Load() || !targetConn.closed.Load() {
+		t.Fatal("revoked user's open flow should be interrupted and its socket closed")
+	}
+	if otherWriter.kicked.Load() || otherConn.closed.Load() {
+		t.Fatal("another user's flow must stay up")
+	}
+
+	lateWriter := &kickWriter{}
+	lateConn := &closeOnlyConn{}
+	late := &transport.Link{Reader: nopReader{}, Writer: lateWriter}
+	if ld.trackLink(userContext(oldUser, lateConn), late, oldUser.Email, "1.1.1.2", true) {
+		t.Fatal("flow authenticated before revoke must not be admitted afterwards")
+	}
+	if !lateWriter.kicked.Load() || !lateConn.closed.Load() {
+		t.Fatal("late registration of a revoked generation must close itself")
+	}
+	if ld.connCount.Load() != 1 {
+		t.Fatalf("connCount = %d, want 1 (only the other user)", ld.connCount.Load())
+	}
+
+	ld.RevokeEmails([]string{oldUser.Email})
+	ld.RevokeEmails(nil)
+	if otherWriter.kicked.Load() {
+		t.Fatal("repeated revoke must not touch the remaining user")
+	}
+}
+
+func TestLimitDispatcher_RemoveThenAddDoesNotKillNewGeneration(t *testing.T) {
+	ld := newTestDispatcher()
+	oldUser := &protocol.MemoryUser{Email: userEmail(7)}
+	ld.Allow(oldUser)
+
+	oldWriter := &kickWriter{}
+	oldConn := &closeOnlyConn{}
+	oldLink := &transport.Link{Reader: nopReader{}, Writer: oldWriter}
+	if !ld.trackLink(userContext(oldUser, oldConn), oldLink, oldUser.Email, "9.9.9.9", true) {
+		t.Fatal("old generation should be admitted")
+	}
+
+	ld.RevokeEmails([]string{oldUser.Email})
+	next := &protocol.MemoryUser{Email: oldUser.Email}
+	ld.Allow(next)
+
+	if !oldWriter.kicked.Load() || !oldConn.closed.Load() {
+		t.Fatal("previous generation must be closed after remove")
+	}
+
+	late := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	lateConn := &closeOnlyConn{}
+	if ld.trackLink(userContext(oldUser, lateConn), late, oldUser.Email, "9.9.9.10", true) {
+		t.Fatal("auth from the removed MemoryUser must not join the new generation")
+	}
+
+	freshWriter := &kickWriter{}
+	freshConn := &closeOnlyConn{}
+	fresh := &transport.Link{Reader: nopReader{}, Writer: freshWriter}
+	if !ld.trackLink(userContext(next, freshConn), fresh, next.Email, "9.9.9.11", true) {
+		t.Fatal("flow authenticated after add must be admitted")
+	}
+	if freshWriter.kicked.Load() || freshConn.closed.Load() {
+		t.Fatal("new generation must not be kicked")
+	}
+	ld.Allow(next)
+	if freshWriter.kicked.Load() {
+		t.Fatal("allowing the same user object again must not kick its flows")
+	}
+}
+
+func TestLimitDispatcher_CloseEmailIsIdempotentAndReleasesDeviceSlot(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(3)
+	user := &protocol.MemoryUser{Email: email}
+	ld.UpdateLimits(map[string]int{email: 3}, map[string]int{email: 1}, nil)
+	ld.Allow(user)
+	if ld.checkDeviceLimit(email, "1.1.1.1", true) {
+		t.Fatal("first device should be allowed")
+	}
+	link := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	conn := &closeOnlyConn{}
+	if !ld.trackLink(userContext(user, conn), link, email, "1.1.1.1", true) {
+		t.Fatal("track should succeed")
+	}
+	if ld.CloseEmail(email) != 1 {
+		t.Fatal("expected one flow to be closed")
+	}
+	if ld.CloseEmail(email) != 0 {
+		t.Fatal("second close must be a no-op")
+	}
+	if ld.connCount.Load() != 0 {
+		t.Fatalf("connCount = %d, want 0", ld.connCount.Load())
+	}
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Fatal("device slot must be released so another IP can connect")
+	}
+	// User remains authorized.
+	again := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if !ld.trackLink(userContext(user, &closeOnlyConn{}), again, email, "2.2.2.2", true) {
+		t.Fatal("same generation can connect again after CloseEmail")
+	}
+}
+
+func TestLimitDispatcher_StaleRevokeDoesNotKillNewGeneration(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(8)
+	oldUser := &protocol.MemoryUser{Email: email}
+	ld.Allow(oldUser)
+	oldLink := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if !ld.trackLink(userContext(oldUser, &closeOnlyConn{}), oldLink, email, "4.4.4.4", true) {
+		t.Fatal("old flow should be admitted")
+	}
+
+	next := &protocol.MemoryUser{Email: email}
+	ld.Allow(next)
+	freshWriter := &kickWriter{}
+	fresh := &transport.Link{Reader: nopReader{}, Writer: freshWriter}
+	if !ld.trackLink(userContext(next, &closeOnlyConn{}), fresh, email, "4.4.4.5", true) {
+		t.Fatal("new generation should be admitted")
+	}
+
+	// The remove that captured oldUser finishes after add. It must not drop next.
+	ld.RevokePointer(oldUser)
+	if freshWriter.kicked.Load() {
+		t.Fatal("stale revoke closed the newer generation")
+	}
+	again := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if !ld.trackLink(userContext(next, &closeOnlyConn{}), again, email, "4.4.4.6", true) {
+		t.Fatal("newer generation must still accept connections")
+	}
+	lateOld := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if ld.trackLink(userContext(oldUser, &closeOnlyConn{}), lateOld, email, "4.4.4.7", true) {
+		t.Fatal("old pointer must stay rejected")
+	}
+}
+
+func TestLimitDispatcher_SamePointersSurviveFullResync(t *testing.T) {
+	ld := newTestDispatcher()
+	a := &protocol.MemoryUser{Email: userEmail(1)}
+	b := &protocol.MemoryUser{Email: userEmail(2)}
+	ld.SetLiveUsers([]*protocol.MemoryUser{a, b})
+	aw := &kickWriter{}
+	bw := &kickWriter{}
+	if !ld.trackLink(userContext(a, &closeOnlyConn{}), &transport.Link{Reader: nopReader{}, Writer: aw}, a.Email, "5.5.5.5", true) {
+		t.Fatal("user a")
+	}
+	if !ld.trackLink(userContext(b, &closeOnlyConn{}), &transport.Link{Reader: nopReader{}, Writer: bw}, b.Email, "5.5.5.6", true) {
+		t.Fatal("user b")
+	}
+	ld.SetLiveUsers([]*protocol.MemoryUser{b, a})
+	if aw.kicked.Load() || bw.kicked.Load() {
+		t.Fatal("resending the same user objects must not kick live flows")
+	}
+}
+
+func TestLimitDispatcher_AdmitRacesRevoke(t *testing.T) {
+	ld := newTestDispatcher()
+	user := &protocol.MemoryUser{Email: userEmail(4)}
+	ld.Allow(user)
+	ctx := userContext(user, &closeOnlyConn{})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			link := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+			_ = ld.trackLink(ctx, link, user.Email, "10.0.0.1", true)
+			if cw, ok := link.Writer.(*closeTrackingWriter); ok {
+				cw.Interrupt()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			ld.RevokeEmails([]string{user.Email})
+			ld.Allow(user)
+		}
+	}()
+	wg.Wait()
+	ld.RevokeEmails([]string{user.Email})
+	if ld.connCount.Load() != 0 {
+		t.Fatalf("connCount = %d, want 0 after draining the race", ld.connCount.Load())
 	}
 }

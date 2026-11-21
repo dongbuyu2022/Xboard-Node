@@ -162,18 +162,16 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 	}
 }
 
-
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
 	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
 	}
-	if caps.ForceCloseConnection || caps.ForceCloseUser {
+	if caps.ForceCloseConnection || !caps.ForceCloseUser {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -189,7 +187,6 @@ func TestXrayUpdateBandwidthLimitsWritesPatchedCoreFeature(t *testing.T) {
 		t.Fatal("expected patched bandwidth feature to receive user limiter")
 	}
 }
-
 
 func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	inst := new(xrayCore.Instance)
@@ -213,7 +210,6 @@ func TestXrayUpdateBandwidthLimitsUsesSpeedLimitFunc(t *testing.T) {
 	}
 }
 
-
 func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 	inst := new(xrayCore.Instance)
 	bm := featurebandwidth.New()
@@ -228,7 +224,6 @@ func TestXrayUpdateBandwidthLimitsFallsBackToUserSpeed(t *testing.T) {
 		t.Fatal("expected fallback limiter derived from user speed")
 	}
 }
-
 
 func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
@@ -257,22 +252,20 @@ func TestXrayUpdateUsersLimitOnlyRefreshesDispatcherAndBandwidth(t *testing.T) {
 	}
 }
 
-func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
+func TestXrayRemoveUsersWithoutUserManagerDoesNotStopListener(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	x.instance = new(xrayCore.Instance)
-	ld := newTestDispatcher()
-	x.limitDispatcher = ld
+	x.limitDispatcher = newTestDispatcher()
 	x.users = []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
 	x.running.Store(true)
 
-	removed, err := x.RemoveUsers([]model.UserSpec{{ID: 1, UUID: "uuid-1"}})
-	if err != nil {
-		t.Fatalf("RemoveUsers() error = %v", err)
+	// A bare instance has no inbound UserManager and no node config to
+	// restart from. Removal must fail cleanly and leave the listener flag
+	// set; a real VLESS runtime keeps the port open with zero users.
+	if _, err := x.RemoveUsers([]model.UserSpec{{ID: 1, UUID: "uuid-1"}}); err == nil {
+		t.Fatal("expected an error when UserManager is unavailable and restart is impossible")
 	}
-	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
-	}
-	if x.IsRunning() {
-		t.Fatal("expected xray to stop when last user is removed")
+	if !x.IsRunning() {
+		t.Fatal("listener flag must stay set when removal cannot restart the kernel")
 	}
 }
