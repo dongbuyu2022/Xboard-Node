@@ -298,14 +298,14 @@ func (d *LimitDispatcher) SetLiveUsers(users []*protocol.MemoryUser) {
 		}
 		d.genSeq++
 		next[user.Email] = &admission{user: user, gen: d.genSeq}
-		closers = append(closers, d.takeClosersLocked(user.Email, user)...)
+		closers = append(closers, d.takeClosersLocked(user.Email, user, nil)...)
 	}
 	if d.live != nil {
 		for email := range d.live {
 			if _, ok := next[email]; ok {
 				continue
 			}
-			closers = append(closers, d.takeClosersLocked(email, nil)...)
+			closers = append(closers, d.takeClosersLocked(email, nil, nil)...)
 		}
 	}
 	d.live = next
@@ -331,15 +331,15 @@ func (d *LimitDispatcher) Allow(user *protocol.MemoryUser) {
 	}
 	d.genSeq++
 	d.live[user.Email] = &admission{user: user, gen: d.genSeq}
-	closers = d.takeClosersLocked(user.Email, user)
+	closers = d.takeClosersLocked(user.Email, user, nil)
 	d.connMu.Unlock()
 	runClosers(closers)
 }
 
-// RevokeEmails drops the live generation for each email and closes every
-// flow already tracked for it. A flow that was authenticated earlier and
-// reaches trackLink afterwards sees no matching pointer and closes itself.
-// Repeated calls are a no-op.
+// RevokeEmails drops whatever generation is currently live for each email and
+// closes its flows. Prefer RevokePointer when the caller still has the
+// MemoryUser it removed: a concurrent add may already have installed a newer
+// pointer, and this call must not delete that generation.
 func (d *LimitDispatcher) RevokeEmails(emails []string) {
 	if d == nil || len(emails) == 0 {
 		return
@@ -350,14 +350,50 @@ func (d *LimitDispatcher) RevokeEmails(emails []string) {
 		d.live = make(map[string]*admission)
 	}
 	for _, email := range emails {
-		if email == "" {
-			continue
-		}
-		delete(d.live, email)
-		closers = append(closers, d.takeClosersLocked(email, nil)...)
+		closers = append(closers, d.revokeLocked(email, nil)...)
 	}
 	d.connMu.Unlock()
 	runClosers(closers)
+}
+
+// RevokePointer retires one authenticated user object. Flows and the live
+// admission are removed only when they still point at that object. A newer
+// Allow of the same email is left in place, including flows it already accepted.
+func (d *LimitDispatcher) RevokePointer(user *protocol.MemoryUser) {
+	if d == nil || user == nil || user.Email == "" {
+		return
+	}
+	d.connMu.Lock()
+	if d.live == nil {
+		d.live = make(map[string]*admission)
+	}
+	closers := d.revokeLocked(user.Email, user)
+	d.connMu.Unlock()
+	runClosers(closers)
+}
+
+// revokeLocked closes flows for email. only, when non-nil, limits the revoke
+// to that MemoryUser so a generation installed by a later add survives.
+func (d *LimitDispatcher) revokeLocked(email string, only *protocol.MemoryUser) []func() {
+	if email == "" {
+		return nil
+	}
+	if only != nil {
+		if adm := d.live[email]; adm != nil && adm.user == only {
+			delete(d.live, email)
+		}
+		return d.takeClosersLocked(email, nil, only)
+	}
+	current := d.live[email]
+	delete(d.live, email)
+	if current == nil {
+		return d.takeClosersLocked(email, nil, nil)
+	}
+	// Email-wide revoke still must not take flows that already belong to a
+	// pointer other than the one we just unpublished. Re-read: we deleted
+	// current, so every tracked flow of this email was authenticated as
+	// current or as an older object. Close all of them.
+	return d.takeClosersLocked(email, nil, nil)
 }
 
 // CloseEmail closes currently tracked flows without removing the user.
@@ -367,15 +403,16 @@ func (d *LimitDispatcher) CloseEmail(email string) int {
 		return 0
 	}
 	d.connMu.Lock()
-	closers := d.takeClosersLocked(email, nil)
+	closers := d.takeClosersLocked(email, nil, nil)
 	d.connMu.Unlock()
 	runClosers(closers)
 	return len(closers)
 }
 
 // takeClosersLocked detaches flows for email. keepUser, when non-nil, leaves
-// flows authenticated as that exact user object in place.
-func (d *LimitDispatcher) takeClosersLocked(email string, keepUser *protocol.MemoryUser) []func() {
+// flows authenticated as that exact user object in place. onlyUser, when
+// non-nil, detaches only flows authenticated as that object.
+func (d *LimitDispatcher) takeClosersLocked(email string, keepUser, onlyUser *protocol.MemoryUser) []func() {
 	set := d.byEmail[email]
 	if len(set) == 0 {
 		return nil
@@ -383,6 +420,9 @@ func (d *LimitDispatcher) takeClosersLocked(email string, keepUser *protocol.Mem
 	var closers []func()
 	for tl := range set {
 		if keepUser != nil && tl.user == keepUser {
+			continue
+		}
+		if onlyUser != nil && tl.user != onlyUser {
 			continue
 		}
 		delete(set, tl)

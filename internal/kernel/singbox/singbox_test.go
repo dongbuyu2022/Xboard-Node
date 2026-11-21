@@ -319,6 +319,74 @@ func TestConnTrackerCloseByUUIDReleasesRefs(t *testing.T) {
 	}
 }
 
+func TestPlanSlotsDoesNotGrowAcrossRestoreAfterGrace(t *testing.T) {
+	prev := tombstoneReuseAfter
+	tombstoneReuseAfter = 0
+	t.Cleanup(func() { tombstoneReuseAfter = prev })
+
+	tracker := NewConnTracker(0)
+	user := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	commitUsers(t, tracker, user)
+	for i := 0; i < 20; i++ {
+		commitUsers(t, tracker, nil)
+		commitUsers(t, tracker, user)
+	}
+	tracker.usersMu.RLock()
+	n := len(tracker.slots)
+	alive := 0
+	for _, slot := range tracker.slots {
+		if slot.alive {
+			alive++
+		}
+	}
+	tracker.usersMu.RUnlock()
+	if alive != 1 {
+		t.Fatalf("alive slots = %d, want 1", alive)
+	}
+	if n > 2 {
+		t.Fatalf("slots after 20 restores = %d, want reuse instead of unbounded growth", n)
+	}
+}
+
+func TestPlanSlotsKeepsFreshTombstone(t *testing.T) {
+	prev := tombstoneReuseAfter
+	tombstoneReuseAfter = time.Hour
+	t.Cleanup(func() { tombstoneReuseAfter = prev })
+
+	tracker := NewConnTracker(0)
+	commitUsers(t, tracker, []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}})
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+	ctx1 := auth.ContextWithUser(context.Background(), 0)
+	c1 := &testConn{}
+	tracker.RoutedConnection(ctx1, c1, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	c2 := &testConn{}
+	tracker.RoutedConnection(auth.ContextWithUser(context.Background(), 1), c2, testInboundContext("uuid-2", "2.2.2.2"), nil, nil)
+
+	closers := commitUsers(t, tracker, []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}})
+	if len(closers) != 0 || c1.isClosed() || c2.isClosed() {
+		t.Fatal("resending the same user list must not close anyone")
+	}
+
+	closers = commitUsers(t, tracker, []model.UserSpec{{ID: 2, UUID: "uuid-2"}})
+	for _, closeFn := range closers {
+		closeFn()
+	}
+	commitUsers(t, tracker, []model.UserSpec{{ID: 1, UUID: "uuid-1"}, {ID: 2, UUID: "uuid-2"}})
+	tracker.usersMu.RLock()
+	n := len(tracker.slots)
+	tracker.usersMu.RUnlock()
+	if n < 3 {
+		t.Fatalf("fresh tombstone was reused, slots=%d", n)
+	}
+	late := &testConn{}
+	if got := tracker.RoutedConnection(ctx1, late, testInboundContext("uuid-1", "9.9.9.9"), nil, nil); got != late || !late.isClosed() {
+		t.Fatal("index captured before remove must not join the restored user")
+	}
+	if c2.isClosed() {
+		t.Fatal("control user was closed")
+	}
+}
+
 func TestConnTrackerReserveRacesSlotRevoke(t *testing.T) {
 	tracker := NewConnTracker(0)
 	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}

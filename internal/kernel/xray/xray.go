@@ -424,19 +424,25 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	ctx := context.Background()
 	actualRemoved := 0
-	removedEmails := emailsForUsers(users, removeSet)
-	for _, email := range removedEmails {
+	ld := x.currentLimitDispatcher()
+	for _, email := range emailsForUsers(users, removeSet) {
+		// Capture the authenticator's object before it is deleted. Revoke
+		// matches that pointer, so an add that already published a newer
+		// object is not torn down.
+		removedUser := um.GetUser(ctx, email)
 		if err := um.RemoveUser(ctx, email); err != nil {
 			nlog.Core().Debug("xray: RemoveUser skipped", "email", email, "error", err)
+		} else {
+			actualRemoved++
+		}
+		if ld == nil {
 			continue
 		}
-		actualRemoved++
-	}
-	// Revoke even when RemoveUser reports the account is already gone.
-	// A flow authenticated against the old MemoryUser must still be closed,
-	// including one that registers only after this call returns.
-	if ld := x.currentLimitDispatcher(); ld != nil {
-		ld.RevokeEmails(removedEmails)
+		if removedUser != nil {
+			ld.RevokePointer(removedUser)
+		} else {
+			ld.RevokeEmails([]string{email})
+		}
 	}
 
 	x.mu.Lock()
@@ -492,16 +498,20 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	// Remove first, then add (order matters for UUID changes on same ID).
 	// Only the removed emails are disconnected; everyone else stays up.
-	removedEmails := make([]string, 0, len(toRemove))
 	for _, u := range toRemove {
 		email := userEmail(u.ID)
-		removedEmails = append(removedEmails, email)
+		removedUser := um.GetUser(ctx, email)
 		if err := um.RemoveUser(ctx, email); err != nil {
 			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
 		}
-	}
-	if ld != nil {
-		ld.RevokeEmails(removedEmails)
+		if ld == nil {
+			continue
+		}
+		if removedUser != nil {
+			ld.RevokePointer(removedUser)
+		} else {
+			ld.RevokeEmails([]string{email})
+		}
 	}
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)

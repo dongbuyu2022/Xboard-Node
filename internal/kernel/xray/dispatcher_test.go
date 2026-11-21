@@ -390,6 +390,58 @@ func TestLimitDispatcher_CloseEmailIsIdempotentAndReleasesDeviceSlot(t *testing.
 	}
 }
 
+func TestLimitDispatcher_StaleRevokeDoesNotKillNewGeneration(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(8)
+	oldUser := &protocol.MemoryUser{Email: email}
+	ld.Allow(oldUser)
+	oldLink := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if !ld.trackLink(userContext(oldUser, &closeOnlyConn{}), oldLink, email, "4.4.4.4", true) {
+		t.Fatal("old flow should be admitted")
+	}
+
+	next := &protocol.MemoryUser{Email: email}
+	ld.Allow(next)
+	freshWriter := &kickWriter{}
+	fresh := &transport.Link{Reader: nopReader{}, Writer: freshWriter}
+	if !ld.trackLink(userContext(next, &closeOnlyConn{}), fresh, email, "4.4.4.5", true) {
+		t.Fatal("new generation should be admitted")
+	}
+
+	// The remove that captured oldUser finishes after add. It must not drop next.
+	ld.RevokePointer(oldUser)
+	if freshWriter.kicked.Load() {
+		t.Fatal("stale revoke closed the newer generation")
+	}
+	again := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if !ld.trackLink(userContext(next, &closeOnlyConn{}), again, email, "4.4.4.6", true) {
+		t.Fatal("newer generation must still accept connections")
+	}
+	lateOld := &transport.Link{Reader: nopReader{}, Writer: &kickWriter{}}
+	if ld.trackLink(userContext(oldUser, &closeOnlyConn{}), lateOld, email, "4.4.4.7", true) {
+		t.Fatal("old pointer must stay rejected")
+	}
+}
+
+func TestLimitDispatcher_SamePointersSurviveFullResync(t *testing.T) {
+	ld := newTestDispatcher()
+	a := &protocol.MemoryUser{Email: userEmail(1)}
+	b := &protocol.MemoryUser{Email: userEmail(2)}
+	ld.SetLiveUsers([]*protocol.MemoryUser{a, b})
+	aw := &kickWriter{}
+	bw := &kickWriter{}
+	if !ld.trackLink(userContext(a, &closeOnlyConn{}), &transport.Link{Reader: nopReader{}, Writer: aw}, a.Email, "5.5.5.5", true) {
+		t.Fatal("user a")
+	}
+	if !ld.trackLink(userContext(b, &closeOnlyConn{}), &transport.Link{Reader: nopReader{}, Writer: bw}, b.Email, "5.5.5.6", true) {
+		t.Fatal("user b")
+	}
+	ld.SetLiveUsers([]*protocol.MemoryUser{b, a})
+	if aw.kicked.Load() || bw.kicked.Load() {
+		t.Fatal("resending the same user objects must not kick live flows")
+	}
+}
+
 func TestLimitDispatcher_AdmitRacesRevoke(t *testing.T) {
 	ld := newTestDispatcher()
 	user := &protocol.MemoryUser{Email: userEmail(4)}
